@@ -1,8 +1,8 @@
 import streamlit as st
 # We will replace this import later with the kernel service
-from ai_logic import get_order_from_text, get_confirmation_message
+from ai_logic import get_order_from_text, get_confirmation_message, process_admin_command, run_autonomous_inventory_check
 import json # Add json for parsing AI responses
-from data.menu_data import MENU # Import MENU from the new file location
+from src.ai_drive_thru.db_utils import get_menu_items, get_item_details, update_item_quantity
 from streamlit_mic_recorder import mic_recorder # Import the recorder
 import io # For handling audio bytes
 from openai import OpenAI # Import OpenAI
@@ -75,6 +75,15 @@ st.set_page_config(layout="wide") # Use wider layout
 st.markdown("<h1 style='text-align: center;'>Welcome to the AI Drive-Thru! 🚗💨</h1>", unsafe_allow_html=True)
 st.write(" ") # Add some space below title
 
+# --- Simple View Selection (Admin vs. User) ---
+# In a real app, this would be replaced by proper authentication/authorization
+view_mode = st.sidebar.radio(
+    "Select View",
+    ["Order Kiosk", "Admin Panel", "AI Chef"], # <-- Added AI Chef option
+    key="view_mode_selector"
+)
+st.sidebar.divider() # Add a visual separator
+
 # --- Initialize Session State ---
 if 'messages' not in st.session_state:
     st.session_state.messages = [{"role": "assistant", "content": "Welcome! Check out the menu or tell me your order."}]
@@ -82,343 +91,482 @@ if 'messages' not in st.session_state:
 if 'current_order_list' not in st.session_state:
     st.session_state.current_order_list = []
 
+# Initialize admin chat history if it doesn't exist
+if 'admin_messages' not in st.session_state:
+    st.session_state.admin_messages = [{"role": "assistant", "content": "Hi Manager! How can I help with the inventory today?"}]
 
-# --- Main Area: Chat and Menu ---
-# Adjust column widths - give chat slightly more space e.g., 3:2 ratio
-col1, col2 = st.columns([3, 2])
+# Initialize AI Chef chat history if it doesn't exist
+if 'ai_chef_messages' not in st.session_state:
+    st.session_state.ai_chef_messages = [{"role": "assistant", "content": "Ask me about menu ideas, item removals, or other menu optimizations!"}]
 
-with col1:
-    st.header("Order Chat")
-    # Add a container for the chat history for potential height control later
-    chat_container = st.container(height=500) # Adjust height as needed
-    with chat_container:
-        # Display prior messages
-        for message in st.session_state.messages:
+# --- Display based on selected view ---
+if view_mode == "Order Kiosk":
+    # --- Main Area: Chat and Menu ---
+    # Adjust column widths - give chat slightly more space e.g., 3:2 ratio
+    col1, col2 = st.columns([3, 2])
+
+    with col1:
+        st.header("Order Chat")
+        # Add a container for the chat history for potential height control later
+        chat_container = st.container(height=500) # Adjust height as needed
+        with chat_container:
+            # Display prior messages
+            for message in st.session_state.messages:
+                with st.chat_message(message["role"]):
+                    st.markdown(message["content"])
+
+        # --- Combine Text and Voice Input Handling ---
+        text_input = st.chat_input("Type your order or ask a question...")
+        voice_input = None # Placeholder for transcribed voice input
+
+        st.write("Or record your order:")
+        # Add the recorder widget
+        # key='recorder' helps manage state. format='webm' is supported by Whisper.
+        audio_info = mic_recorder(
+            start_prompt="🎤 Start Recording",
+            stop_prompt="⏹️ Stop Recording",
+            key='recorder',
+            format='wav',
+            just_once=True # Return audio only once after recording
+        )
+
+        # Check if audio has been recorded
+        if audio_info and client: # Only proceed if recorder returned data AND client is initialized
+            audio_bytes = audio_info['bytes']
+            # Add a check for empty audio data
+            if not audio_bytes:
+                st.warning("Received empty audio recording. Please try again.")
+            else:
+                audio_bio = io.BytesIO(audio_bytes)
+                audio_bio.name = 'audio.wav' # Required for OpenAI API
+
+                # Display audio player for debugging/confirmation (optional)
+                # st.audio(audio_bytes, format='audio/wav') # Update format if uncommenting
+
+                with st.spinner("Transcribing voice..."):
+                    try:
+                        transcript = client.audio.transcriptions.create(
+                            model="whisper-1",
+                            file=audio_bio
+                        )
+                        voice_input = transcript.text
+                        st.success(f"Heard: {voice_input}") # Show transcription
+                    except Exception as e:
+                        st.error(f"Error transcribing audio: {e}")
+                        voice_input = None # Ensure it's None if transcription failed
+
+
+        # Determine the prompt to process (prioritize voice if available)
+        prompt = voice_input if voice_input else text_input
+
+        # Proceed only if there is a valid prompt (from text or voice)
+        if prompt:
+            # Add user message to state and display (inside container)
+            # Use a mic icon if it came from voice
+            user_avatar = "🎤" if voice_input else "👤"
+            with chat_container:
+                 with st.chat_message("user", avatar=user_avatar):
+                     st.markdown(prompt)
+            st.session_state.messages.append({"role": "user", "content": prompt})
+
+            # Process the input with AI using the updated ai_logic
+            with st.spinner("Processing order..."):
+                # Call the refactored function from ai_logic.py
+                ai_response = get_order_from_text(prompt) # ai_response is now a dict
+
+            # --- Process AI Response ---
+            # Initialize variables
+            ai_message_content = "" # Main response message
+            stock_message_content = "" # Separate message for stock issues
+            update_ui = False # Flag to indicate if we need to update UI state (e.g., sidebar)
+            show_error_in_chat = False
+
+            # 1. Check for explicit errors from ai_logic
+            if "error" in ai_response:
+                error_detail = ai_response.get('error', 'Unknown error from AI logic.')
+                # Include raw response if available for debugging
+                raw_resp_info = ai_response.get("raw_response", "")
+                if raw_resp_info:
+                     error_detail += f"\nRaw AI Response:\n```\n{raw_resp_info}\n```"
+
+                ai_message_content = f"An error occurred: {error_detail}"
+                show_error_in_chat = True # Will display using st.error later
+
+            else:
+                # 2. Check for unavailable items (even if other parts succeeded)
+                unavailable_items = ai_response.get("unavailable_items")
+                if unavailable_items:
+                    stock_messages = []
+                    for item_info in unavailable_items:
+                        item_name = item_info.get("item", "Unknown item")
+                        reason = item_info.get("reason", "unavailable")
+                        stock_messages.append(f"{item_name} ({reason})")
+                    if stock_messages:
+                        stock_message_content = f"Sorry, there were issues with some items: {'; '.join(stock_messages)}."
+
+                # 3. Process the main status and actions
+                status = ai_response.get("status", "unknown") # Default to 'unknown' if status missing
+
+                if status == "success":
+                    actions = ai_response.get("actions", [])
+                    if actions:
+                        items_added = []
+                        items_removed = []
+                        items_not_found_for_removal = []
+
+                        for action_data in actions:
+                            action_type = action_data.get('action')
+                            item_key = action_data.get('item')
+                            details = action_data.get('details')
+                            try:
+                                quantity = int(action_data.get('quantity', 1))
+                            except (ValueError, TypeError):
+                                quantity = 1
+
+                            if not item_key or quantity <= 0:
+                                continue # Skip invalid actions
+
+                            detail_str = f' ({details})' if details else ''
+                            # Use the actual quantity processed by add/remove functions if needed, but for msg, use requested
+                            item_desc = f"{quantity}x {item_key}{detail_str}"
+
+                            if action_type == 'add':
+                                # We rely on ai_logic already filtering out items that *cannot* be added at all due to stock.
+                                # The add_item_to_order here just updates the UI state.
+                                add_item_to_order(item_key, details)
+                                items_added.append(item_desc)
+                                update_ui = True
+                            elif action_type == 'remove':
+                                removed = remove_item_from_order(item_key, quantity, details)
+                                if removed:
+                                    items_removed.append(item_desc)
+                                    update_ui = True
+                                else:
+                                    items_not_found_for_removal.append(item_desc)
+
+                        # Construct confirmation message based on performed actions
+                        message_parts = []
+                        if items_added:
+                            message_parts.append(f"Added {', '.join(items_added)}")
+                        if items_removed:
+                            message_parts.append(f"Removed {', '.join(items_removed)}")
+
+                        ai_generated_message = ai_response.get("message")
+                        if ai_generated_message and (items_added or items_removed):
+                            ai_message_content = ai_generated_message
+                        elif message_parts:
+                            ai_message_content = f"Okay, I've {', '.join(message_parts)}."
+                        else:
+                            if items_not_found_for_removal:
+                                 ai_message_content = f"I tried to remove {', '.join(items_not_found_for_removal)}, but I couldn't find those items in your order."
+                            else:
+                                 # Success status but no actions? Maybe just acknowledgment. Use AI message if present.
+                                 ai_message_content = ai_response.get("message", "Okay.") # Fallback if no message/actions
+
+                    else:
+                         # Status is success, but actions list is empty
+                         # This might happen if the user asks "Do you have Fries?" and they are in stock.
+                         ai_message_content = ai_response.get("message", "Okay, understood.") # Use AI message or a default
+
+                elif status == "clarification":
+                    ai_message_content = ai_response.get("message", "Could you please provide more details?") # Use AI message or fallback
+                    # Optionally add clarification details if structured differently
+                    # e.g., list options if "clarification_options" key exists
+
+                elif status == "not_an_order":
+                    ai_message_content = ai_response.get("message", "How can I help you with your order?") # Use AI message or fallback
+
+                # ADDED: Explicit handling for item_unavailable status
+                elif status == "item_unavailable":
+                    ai_message_content = ai_response.get("message", "Sorry, the requested item is unavailable.") # Use AI message or fallback
+                    # Note: The stock_message_content check before this might have already caught specifics
+                    # if our db_utils check found it first, but this handles cases where the LLM returns the status directly.
+
+                elif status == "unknown":
+                     ai_message_content = "Sorry, I didn't quite understand that. Can you please rephrase?"
+                     # Log the raw response if status is unknown for debugging
+                     print(f"Unknown status from ai_logic. Raw response: {ai_response.get('raw_response')}")
+
+                else: # Handle any other unexpected statuses
+                     ai_message_content = f"Sorry, I encountered an unexpected situation (status: {status})."
+                     print(f"Unexpected status '{status}' from ai_logic. Raw response: {ai_response.get('raw_response')}")
+
+
+            # --- Display Assistant Messages (Stock + Main Response) ---
+            with chat_container:
+                # Display stock message first if there is one
+                if stock_message_content:
+                    with st.chat_message("assistant", avatar="ℹ️"): # Info icon for stock notice
+                        st.warning(stock_message_content) # Use warning styling for visibility
+                    st.session_state.messages.append({"role": "assistant", "content": stock_message_content})
+
+                # Display the main AI response or error message
+                if show_error_in_chat:
+                    with st.chat_message("assistant", avatar="🚨"): # Use an error avatar
+                        st.error(ai_message_content) # Display the detailed error message
+                    # Add simplified error to history
+                    st.session_state.messages.append({"role": "assistant", "content": f"An error occurred: {ai_response.get('error', 'Unknown error')}"})
+                elif ai_message_content: # Only display if there's content (and not already handled by error)
+                     with st.chat_message("assistant"):
+                         st.markdown(ai_message_content)
+                     st.session_state.messages.append({"role": "assistant", "content": ai_message_content})
+
+
+            # Trigger UI update if order changed
+            if update_ui:
+                st.rerun()
+
+    with col2:
+        st.header("Menu")
+        # Fetch menu items from the database
+        menu_items_from_db = get_menu_items()
+
+        if not menu_items_from_db:
+            st.write("Menu is currently unavailable.")
+        else:
+            # Display items directly, without categories for now
+            for item in menu_items_from_db:
+                if item['quantity'] > 0: # Only show items in stock
+                    # Use item details from DB
+                    item_name = item['name']
+                    item_price = item['price']
+                    # Add description as tooltip if available
+                    item_description = item.get('description', '') # Get description or empty string
+
+                    # Create a unique key for the button
+                    button_key = f"add_{item_name}".replace(" ", "_").replace("(", "").replace(")", "")
+                    button_label = f"Add {item_name} (${item_price:.2f})"
+
+                    if st.button(button_label, key=button_key, use_container_width=True, help=item_description):
+                        # Add item using its name (assuming name is the unique identifier for adding)
+                        # If we later need variations (like Soda flavors), this might need adjustment
+                        # based on how variations are stored and selected.
+                        add_item_to_order(item_name) # Pass item name as the key
+                        st.rerun() # Rerun to update the sidebar immediately
+
+
+    # --- Sidebar: Order Summary ---
+    st.sidebar.header("Your Current Order")
+    if st.session_state.current_order_list:
+        total_price = 0
+        for i, item_in_order in enumerate(st.session_state.current_order_list):
+            item_name = item_in_order['item']
+            item_details_from_db = get_item_details(item_name) # Fetch details from DB
+
+            if item_details_from_db:
+                item_price = item_details_from_db['price']
+                # If we stored icons in DB, fetch here: item_icon = item_details_from_db.get("icon", " ") + " "
+                item_icon = "🍔 " # Placeholder icon, replace if DB has icons
+
+            else:
+                # Handle case where item in order list is somehow not in DB (shouldn't happen ideally)
+                item_price = 0
+                item_icon = "❓ "
+                print(f"Warning: Item '{item_name}' from order list not found in DB for price lookup.")
+
+
+            item_quantity = item_in_order['quantity']
+            item_total = item_quantity * item_price
+            total_price += item_total
+
+            # Display name logic remains similar, using item_name from order list
+            display_name = f"{item_name}{' (' + item_in_order['details'] + ')' if 'details' in item_in_order else ''}"
+            st.sidebar.write(f"{item_icon}{item_quantity}x {display_name} (${item_total:.2f})")
+
+        st.sidebar.markdown("---") # Add a separator
+        st.sidebar.subheader(f"Total: ${total_price:.2f}")
+        st.sidebar.markdown("---") # Add a separator
+
+        if st.sidebar.button("Confirm Order", use_container_width=True):
+            # 1. Get confirmation message from AI
+            with st.spinner("Generating confirmation..."):
+                confirmation_response = get_confirmation_message(st.session_state.current_order_list)
+
+            # 2. Display confirmation message (or error) in the chat
+            if "error" in confirmation_response:
+                error_msg = confirmation_response.get("error", "Could not generate confirmation.")
+                st.sidebar.error(f"Error confirming order: {error_msg}") # Show error in sidebar
+                # Optionally add to chat history too
+                st.session_state.messages.append({"role": "assistant", "content": f"Sorry, there was an error generating the confirmation: {error_msg}"})
+                st.rerun() # Rerun to show the message in chat history
+            else:
+                confirmation_text = confirmation_response.get("confirmation", "Please review your order.")
+                # Add AI confirmation message to chat history
+                st.session_state.messages.append({"role": "assistant", "content": confirmation_text})
+
+                # 3. Placeholder for actual confirmation logic (e.g., asking user Y/N)
+                # For now, we'll just display the confirmation message and proceed
+                # TODO: Add user interaction step (e.g., buttons Yes/No in chat or sidebar)
+
+                # 4. Show success animation and message (as before)
+                st.balloons()
+                st.sidebar.success("Order Confirmed! Proceed to payment.") # Keep simple success message for now
+
+                # 5. Optionally clear order and messages for next customer
+                # Clear order after confirmation
+                # st.session_state.current_order_list = []
+                # st.session_state.messages = [{"role": "assistant", "content": "Order placed! How can I help the next customer?"}]
+                # st.rerun()
+                # Rerun needed to display the confirmation message added to chat history
+                st.rerun()
+
+        if st.sidebar.button("Clear Order", type="secondary", use_container_width=True):
+            st.session_state.current_order_list = []
+            # Add message to chat history about clearing order
+            st.session_state.messages.append({"role": "assistant", "content": "Okay, I've cleared your current order."})
+            st.rerun()
+
+    else:
+        st.sidebar.write("Your order is empty.")
+        st.sidebar.markdown("---")
+
+elif view_mode == "Admin Panel":
+    st.header("Admin Management")
+
+    # --- Restore Stock Display Section ---
+    st.subheader("Current Stock Levels")
+    try:
+        inventory_items = get_menu_items() # Fetch items including quantities
+        if inventory_items:
+            # Display as a dataframe for a quick overview
+            st.dataframe(inventory_items, use_container_width=True)
+        else:
+            st.warning("No inventory items found or unable to load.")
+    except Exception as e:
+        st.error(f"Error loading inventory: {e}")
+        inventory_items = [] # Ensure list exists even on error
+    st.divider()
+
+    # --- Admin Command Section (Existing) ---
+    st.subheader("Admin Commands") # Renamed slightly for clarity
+
+    # Display prior admin messages
+    admin_chat_container = st.container(height=300) # Adjust height if needed
+    with admin_chat_container:
+        for message in st.session_state.admin_messages:
             with st.chat_message(message["role"]):
                 st.markdown(message["content"])
 
-    # --- Combine Text and Voice Input Handling ---
-    text_input = st.chat_input("Type your order or ask a question...")
-    voice_input = None # Placeholder for transcribed voice input
+    # Admin command input
+    if admin_prompt := st.chat_input("Enter admin command (e.g., 'low stock report', 'add 5 burger buns')"):
+        st.session_state.admin_messages.append({"role": "user", "content": admin_prompt})
+        # Display user message immediately in the container
+        with admin_chat_container:
+            with st.chat_message("user"):
+                st.markdown(admin_prompt)
 
-    st.write("Or record your order:")
-    # Add the recorder widget
-    # key='recorder' helps manage state. format='webm' is supported by Whisper.
-    audio_info = mic_recorder(
-        start_prompt="🎤 Start Recording",
-        stop_prompt="⏹️ Stop Recording",
-        key='recorder',
-        format='wav',
-        just_once=True # Return audio only once after recording
-    )
+        with st.spinner("Processing command..."):
+            response_data = process_admin_command(admin_prompt)
+            response_text = response_data.get("response", "Could not process the command.")
 
-    # Check if audio has been recorded
-    if audio_info and client: # Only proceed if recorder returned data AND client is initialized
-        audio_bytes = audio_info['bytes']
-        # Add a check for empty audio data
-        if not audio_bytes:
-            st.warning("Received empty audio recording. Please try again.")
-        else:
-            audio_bio = io.BytesIO(audio_bytes)
-            audio_bio.name = 'audio.wav' # Required for OpenAI API
+            # Check if inventory might have changed and trigger rerun
+            if response_data.get("inventory_updated"): # Assumes process_admin_command returns this flag
+                 st.toast("Inventory possibly updated by command.")
+                 # Add assistant response *before* rerunning
+                 st.session_state.admin_messages.append({"role": "assistant", "content": response_text})
+                 st.rerun() # Rerun to refresh stock display
+            else:
+                 # Add response to state normally if no rerun needed yet
+                 st.session_state.admin_messages.append({"role": "assistant", "content": response_text})
+                 # Display assistant response immediately without full rerun if no inventory change
+                 with admin_chat_container:
+                     with st.chat_message("assistant"):
+                         st.markdown(response_text)
 
-            # Display audio player for debugging/confirmation (optional)
-            # st.audio(audio_bytes, format='audio/wav') # Update format if uncommenting
+    # --- AI Chef Section REMOVED from here --- 
 
-            with st.spinner("Transcribing voice..."):
+elif view_mode == "AI Chef": # <-- New view block
+    st.header("AI Chef Assistant 🧑‍🍳")
+
+    # Option to view current menu within the Chef section
+    with st.expander("View/Hide Current Menu"):
+        try:
+            # Fetch fresh menu data directly here, ensures it's current for this view
+            menu_items_for_chef = get_menu_items()
+            if menu_items_for_chef:
+                st.dataframe(menu_items_for_chef) # Display as a table/dataframe
+            else:
+                st.write("Menu is currently empty or could not be loaded.")
+        except Exception as e:
+            st.error(f"Error loading menu: {e}")
+            menu_items_for_chef = [] # Ensure it's an empty list on error
+
+    # Display AI Chef chat history
+    chef_chat_container = st.container(height=500) # Adjust height as needed for main panel view
+    with chef_chat_container:
+        for message in st.session_state.ai_chef_messages:
+            with st.chat_message(message["role"]):
+                st.markdown(message["content"])
+
+    # AI Chef chat input
+    if chef_prompt := st.chat_input("Chat with the AI Chef about the menu..."):
+        # Add user message to chef chat state and display immediately
+        st.session_state.ai_chef_messages.append({"role": "user", "content": chef_prompt})
+        with chef_chat_container:
+            with st.chat_message("user"):
+                st.markdown(chef_prompt)
+
+        # --- LLM Interaction ---
+        with st.spinner("AI Chef is thinking..."):
+            ai_chef_response = "Sorry, I couldn't process that request right now." # Default error message
+            if not client:
+                ai_chef_response = "Error: OpenAI client not initialized. Please check API key."
+                st.error(ai_chef_response)
+            else:
                 try:
-                    transcript = client.audio.transcriptions.create(
-                        model="whisper-1",
-                        file=audio_bio
+                    # Fetch menu again inside the interaction if necessary, or rely on the one fetched above
+                    # Re-fetching ensures latest data if menu could change rapidly, but uses more resources.
+                    # Using menu_items_for_chef fetched earlier should be sufficient for most cases.
+                    if not menu_items_for_chef and 'menu_items_for_chef' in locals(): # Check if fetch failed earlier
+                         menu_string_for_prompt = "Menu data could not be loaded."
+                    elif menu_items_for_chef:
+                         menu_string_for_prompt = json.dumps(menu_items_for_chef, indent=2)
+                    else:
+                         menu_string_for_prompt = "The menu is currently empty or could not be loaded."
+
+                    # Define System and User messages
+                    system_message = (
+                        "You are an AI Chef assistant for a drive-thru restaurant. "
+                        "Your goal is to help the manager refine the menu based on creative ideas, potential ingredient availability (represented by quantity in the data), sales trends (if provided), and user requests. "
+                        "Be creative but practical for a drive-thru setting. Provide concise and actionable suggestions or answers."
                     )
-                    voice_input = transcript.text
-                    st.success(f"Heard: {voice_input}") # Show transcription
+                    user_message_content = (
+                        f"Current Menu Data:\n"
+                        f"```json\n{menu_string_for_prompt}\n```\n\n"
+                        f"Manager's request: \"{chef_prompt}\"\n\n"
+                        f"Based on the current menu and the manager's request, provide suggestions, answer questions, or propose new menu items. "
+                        f"Consider item quantities if the request involves availability. Think step-by-step."
+                    )
+
+                    messages_for_api = [
+                        {"role": "system", "content": system_message},
+                        {"role": "user", "content": user_message_content}
+                    ]
+
+                    # Call OpenAI API
+                    completion = client.chat.completions.create(
+                        model="gpt-3.5-turbo",
+                        messages=messages_for_api
+                    )
+                    ai_chef_response = completion.choices[0].message.content
+
+                except NameError: # Handle case where menu_items_for_chef wasn't defined due to initial load error
+                    st.error("Error: Menu data not available for AI Chef context.")
+                    ai_chef_response = "Sorry, I cannot process the request without menu data."
                 except Exception as e:
-                    st.error(f"Error transcribing audio: {e}")
-                    voice_input = None # Ensure it's None if transcription failed
+                    st.error(f"Error communicating with AI Chef: {e}")
+                    ai_chef_response = f"Sorry, an error occurred while contacting the AI Chef: {e}"
 
-
-    # Determine the prompt to process (prioritize voice if available)
-    prompt = voice_input if voice_input else text_input
-
-    # Proceed only if there is a valid prompt (from text or voice)
-    if prompt:
-        # Add user message to state and display (inside container)
-        # Use a mic icon if it came from voice
-        user_avatar = "🎤" if voice_input else "👤"
-        with chat_container:
-             with st.chat_message("user", avatar=user_avatar):
-                 st.markdown(prompt)
-        st.session_state.messages.append({"role": "user", "content": prompt})
-
-        # Process the input with AI using the updated ai_logic
-        with st.spinner("Processing order..."):
-            # Call the refactored function from ai_logic.py
-            ai_response = get_order_from_text(prompt) # ai_response is now a dict
-
-        # Process the structured response from ai_logic
-        ai_message_content = ""
-        update_ui = False # Flag to indicate if we need to update UI state (e.g., sidebar)
-        show_error_in_chat = False
-
-        # Check if the AI logic itself returned an error
-        if "error" in ai_response:
-            error_detail = ai_response.get('error', 'Unknown error from AI logic.')
-            # Include raw response if available for debugging
-            raw_resp_info = ai_response.get("raw_response", "")
-            if raw_resp_info:
-                 error_detail += f"\nRaw AI Response:\n```\n{raw_resp_info}\n```"
-
-            ai_message_content = f"An error occurred: {error_detail}"
-            # Display technical errors using st.error within the chat message for clarity
-            with chat_container:
-                with st.chat_message("assistant", avatar="🚨"): # Use an error avatar
-                    st.error(ai_message_content)
-            # Also add to history, but maybe without the full raw response for brevity
-            st.session_state.messages.append({"role": "assistant", "content": f"An error occurred: {ai_response.get('error', 'Unknown error')}"})
-            show_error_in_chat = True # Prevent default message display below
-
-        else:
-            # If no direct error, process the structured response based on 'status'
-            status = ai_response.get("status", "unknown") # Default to 'unknown' if status missing
-
-            if status == "success":
-                actions = ai_response.get("actions", [])
-                if actions:
-                    items_added = []
-                    items_removed = []
-                    items_not_found_for_removal = []
-
-                    for action_data in actions:
-                        action_type = action_data.get('action')
-                        item_key = action_data.get('item')
-                        details = action_data.get('details')
-                        try:
-                            quantity = int(action_data.get('quantity', 1))
-                        except (ValueError, TypeError):
-                            quantity = 1
-
-                        if not item_key or quantity <= 0:
-                            continue # Skip invalid actions
-
-                        detail_str = f' ({details})' if details else ''
-                        item_desc = f"{quantity}x {item_key}{detail_str}"
-
-                        if action_type == 'add':
-                            add_item_to_order(item_key, details)
-                            # Note: add_item_to_order increments quantity internally,
-                            # so we add the description based on the requested quantity.
-                            items_added.append(item_desc)
-                            update_ui = True
-                        elif action_type == 'remove':
-                            removed = remove_item_from_order(item_key, quantity, details)
-                            if removed:
-                                items_removed.append(item_desc)
-                                update_ui = True
-                            else:
-                                # Track items the AI tried to remove but weren't in the order
-                                items_not_found_for_removal.append(item_desc)
-
-                    # Construct confirmation message based on performed actions
-                    message_parts = []
-                    if items_added:
-                        message_parts.append(f"Added {', '.join(items_added)}")
-                    if items_removed:
-                        message_parts.append(f"Removed {', '.join(items_removed)}")
-
-                    # Use the AI's generated message if available and seems reasonable,
-                    # otherwise construct one.
-                    ai_generated_message = ai_response.get("message")
-                    if ai_generated_message and (items_added or items_removed):
-                        ai_message_content = ai_generated_message
-                    elif message_parts:
-                        ai_message_content = f"Okay, I've {' and '.join(message_parts)}."
-                    else:
-                        # Handle cases where AI returns success but no valid actions are parsed or performed
-                        if items_not_found_for_removal:
-                             ai_message_content = f"I tried to remove {', '.join(items_not_found_for_removal)}, but I couldn't find those exact items in your order."
-                             update_ui = False # No actual change to the order
-                        else:
-                             # If text came from voice, maybe give a slightly different message
-                             if voice_input:
-                                 ai_message_content = "I heard you, but couldn't identify specific items in your request to add or remove from the order."
-                             else:
-                                 ai_message_content = "I understood the request, but couldn't identify specific actions to perform. Could you please rephrase?"
-
-                else:
-                    # Status is success, but actions list is empty
-                    # If text came from voice, maybe give a slightly different message
-                    if voice_input:
-                        ai_message_content = "I heard you, but didn't find specific items in your request to add or remove."
-                    else:
-                        ai_message_content = "I understood you, but didn't find specific items in your request to add or remove."
-
-
-            elif status in ["clarification_needed", "item_unavailable", "not_an_order"]:
-                # These statuses should have a 'message' intended for the user
-                ai_message_content = ai_response.get("message", f"I received a '{status}' status but no message. Could you please rephrase?")
-                # No UI update needed as the order hasn't changed
-
-            elif status == "unknown":
-                 ai_message_content = "Sorry, I received an unexpected response structure. Please try again."
-                 # Optionally log the raw response for debugging
-                 print(f"Unknown status received. Raw response: {ai_response.get('raw_response', ai_response)}")
-
-            else: # Handle any other unexpected status values
-                ai_message_content = f"Sorry, I couldn't process that due to an unexpected status: {status}. Please try again."
-                # Optionally log the raw response
-                print(f"Unexpected status: {status}. Raw response: {ai_response.get('raw_response', ai_response)}")
-
-
-        # Display AI response in chat history (unless it was a technical error shown via st.error)
-        if not show_error_in_chat and ai_message_content:
-            # --- Add Text-to-Speech --- 
-            st.write("Attempting to generate speech...") # Debug message
-            if client: # Check if OpenAI client is available
-                try:
-                    with st.spinner("Generating audio response..."):
-                        response = client.audio.speech.create(
-                            model="tts-1", # Choose a TTS model (tts-1 is standard)
-                            voice="alloy", # Choose a voice (e.g., alloy, echo, fable, onyx, nova, shimmer)
-                            input=ai_message_content,
-                            response_format="mp3" # Choose audio format
-                        )
-                        # Play the audio automatically - TEMPORARILY DISABLED FOR DEBUGGING
-                        st.audio(response.read(), format="audio/mp3") # Removed autoplay=True
-                        st.write("Audio player should be visible above.") # Debug message
-                except Exception as e:
-                    st.error(f"Could not generate audio response: {e}") # Use st.error for visibility
-            # --- End Text-to-Speech ---
-            
-            with chat_container:
-                with st.chat_message("assistant"):
-                    st.markdown(ai_message_content)
-            st.session_state.messages.append({"role": "assistant", "content": ai_message_content})
-
-        # If the order was updated OR if voice input was processed, trigger a rerun
-        if update_ui or voice_input:
-             st.rerun()
-
-with col2:
-    st.header("Menu")
-    # Use expanders for categories
-    for category, items in MENU.items():
-        with st.expander(f"**{category}**", expanded=True): # Start expanded
-            for name, details in items.items():
-                icon = details.get("icon", "") # Get icon, default to empty string
-                # Include icon in the button label
-                button_label = f"{icon} Add {name} (${details['price']:.2f})"
-                button_key = f"add_{category}_{name}".replace(" ", "_").replace("(", "").replace(")", "")
-                if st.button(button_label, key=button_key, use_container_width=True):
-                    add_item_to_order(details['item_key'], details.get('details'))
-                    st.rerun() # Rerun to update the sidebar immediately
-
-
-# --- Sidebar: Order Summary ---
-st.sidebar.header("Your Current Order")
-if st.session_state.current_order_list:
-    total_price = 0
-    for i, item in enumerate(st.session_state.current_order_list):
-        item_price = 0
-        found_price = False
-        for category_items in MENU.values():
-            for menu_name, menu_details in category_items.items():
-                 if menu_details['item_key'] == item['item'] and menu_details.get('details') == item.get('details'):
-                     item_price = menu_details['price']
-                     found_price = True
-                     break
-            if found_price:
-                break
-
-        item_total = item['quantity'] * item_price
-        total_price += item_total
-        # Try to find icon for the sidebar display too
-        item_icon = ""
-        found_icon = False
-        for category_items in MENU.values():
-             for menu_name, menu_details in category_items.items():
-                 if menu_details['item_key'] == item['item'] and menu_details.get('details') == item.get('details'):
-                    item_icon = menu_details.get("icon", " ") + " " # Add space after icon
-                    found_icon = True
-                    break
-             if found_icon:
-                break
-
-        display_name = f"{item['item']}{' (' + item['details'] + ')' if 'details' in item else ''}"
-        st.sidebar.write(f"{item_icon}{item['quantity']}x {display_name} (${item_total:.2f})") # Add icon here
-
-    st.sidebar.markdown("---") # Add a separator
-    st.sidebar.subheader(f"Total: ${total_price:.2f}")
-    st.sidebar.markdown("---") # Add a separator
-
-    if st.sidebar.button("Confirm Order", use_container_width=True):
-        # 1. Get confirmation message from AI
-        with st.spinner("Generating confirmation..."):
-            confirmation_response = get_confirmation_message(st.session_state.current_order_list)
-
-        # 2. Display confirmation message (or error) in the chat
-        if "error" in confirmation_response:
-            error_msg = confirmation_response.get("error", "Could not generate confirmation.")
-            st.sidebar.error(f"Error confirming order: {error_msg}") # Show error in sidebar
-            # Optionally add to chat history too
-            st.session_state.messages.append({"role": "assistant", "content": f"Sorry, there was an error generating the confirmation: {error_msg}"})
-            st.rerun() # Rerun to show the message in chat history
-        else:
-            confirmation_text = confirmation_response.get("confirmation", "Please review your order.")
-            # Add AI confirmation message to chat history
-            st.session_state.messages.append({"role": "assistant", "content": confirmation_text})
-
-            # 3. Placeholder for actual confirmation logic (e.g., asking user Y/N)
-            # For now, we'll just display the confirmation message and proceed
-            # TODO: Add user interaction step (e.g., buttons Yes/No in chat or sidebar)
-
-            # 4. Show success animation and message (as before)
-            st.balloons()
-            st.sidebar.success("Order Confirmed! Proceed to payment.") # Keep simple success message for now
-
-            # 5. Optionally clear order and messages for next customer
-            # Clear order after confirmation
-            # st.session_state.current_order_list = []
-            # st.session_state.messages = [{"role": "assistant", "content": "Order placed! How can I help the next customer?"}]
-            # st.rerun()
-            # Rerun needed to display the confirmation message added to chat history
-            st.rerun()
-
-    if st.sidebar.button("Clear Order", type="secondary", use_container_width=True):
-        st.session_state.current_order_list = []
-        # Add message to chat history about clearing order
-        st.session_state.messages.append({"role": "assistant", "content": "Okay, I've cleared your current order."})
+        # Display AI Chef's response and add to state
+        st.session_state.ai_chef_messages.append({"role": "assistant", "content": ai_chef_response})
+        # Rerun to display the new messages in the container immediately
         st.rerun()
 
-else:
-    st.sidebar.write("Your order is empty.")
-    st.sidebar.markdown("---")
+# --- Sidebar: Order Summary --- 
+# ... (Sidebar code remains unchanged) ...
 
-# --- (Placeholder logic we removed - cleanup) ---
-# # --- Order Summary (Placeholder) ---
-# st.sidebar.header("Your Current Order")
-# if st.session_state.current_order: # Old state variable
-#     st.sidebar.json(st.session_state.current_order)
-# else:
-#     st.sidebar.write("Your order is empty.")
-#
-# # --- Checkout Button (Placeholder) ---
-# if st.session_state.current_order: # Old state variable
-#     if st.sidebar.button("Confirm Order"):
-#         st.balloons()
-#         st.sidebar.success("Order Confirmed! Proceed to payment.")
-#         # TODO: Add logic to finalize order, clear state etc.
-
-# --- Order Summary (Placeholder) ---
-# st.sidebar.header("Your Current Order")
-# if st.session_state.current_order:
-#     st.sidebar.json(st.session_state.current_order)
-# else:
-#     st.sidebar.write("Your order is empty.")
-#
-# # --- Checkout Button (Placeholder) ---
-# if st.session_state.current_order:
-#     if st.sidebar.button("Confirm Order"):
-#         st.balloons()
-#         st.sidebar.success("Order Confirmed! Proceed to payment.")
-#         # TODO: Add logic to finalize order, clear state etc. 
+# --- Run the app check ---
+# This check prevents Streamlit from rerunning the entire script unnecessarily on every interaction.
+# However, we DO need it to rerun when switching views or updating inventory, so we manage reruns explicitly.
+# if __name__ == "__main__": # Standard check if running as script (less relevant for Streamlit directly)
+#     pass # Streamlit handles the main loop automatically 
