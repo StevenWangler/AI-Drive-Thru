@@ -5,6 +5,7 @@ from semantic_kernel.connectors.ai.open_ai import OpenAIChatCompletion
 from semantic_kernel.functions import KernelFunctionFromPrompt
 from semantic_kernel.functions import KernelArguments
 import json
+from data.menu_data import MENU # Import MENU from the new file location
 
 load_dotenv() # Load environment variables from .env file
 
@@ -29,35 +30,54 @@ kernel.add_service(
 # Define the path to the prompts directory
 prompts_dir = os.path.join(os.path.dirname(__file__), "prompts")
 
+# --- Helper Function to Format Menu ---
+def format_menu_for_prompt(menu_data: dict) -> str:
+    """Formats the MENU dictionary into a simple string for the LLM prompt."""
+    menu_lines = []
+    processed_item_keys = set() # Keep track of item keys already added for combined items
+    for category, items in menu_data.items():
+        # menu_lines.append(f"**{category}**") # Optional: Include category headers
+        for name, details in items.items():
+            item_key = details["item_key"]
+            price = details["price"]
+
+            # Handle items with details (like Soda, Milkshake) combining variations
+            if details.get("details"):
+                if item_key not in processed_item_keys:
+                    variations = sorted([d.get("details") for d_name, d in items.items() if d["item_key"] == item_key])
+                    menu_lines.append(f"- {item_key} ({', '.join(filter(None, variations))}): ${price:.2f}")
+                    processed_item_keys.add(item_key) # Mark as processed
+            # Handle simple items (like Burger, Fries)
+            else:
+                 if item_key not in processed_item_keys:
+                     menu_lines.append(f"- {name}: ${price:.2f}") # Use name directly if no details
+                     processed_item_keys.add(item_key) # Mark as processed (though likely unique anyway)
+
+    return "\\n".join(menu_lines)
+
 # Load the OrderTaker function from its prompty file content
 try:
     order_taker_path = os.path.join(prompts_dir, "OrderTaker.prompty")
+    # Revert to using from_yaml, loading the file content first
     with open(order_taker_path, 'r') as f:
         order_taker_yaml = f.read()
-    # Create function from YAML content
     order_taker_func = KernelFunctionFromPrompt.from_yaml(order_taker_yaml)
-    # Optional: Add the function to the kernel's plugins if needed for planners, etc.
-    # kernel.plugins.add_functions(
-    #    sk.KernelPlugin(name="OrderPlugin", functions=[order_taker_func])
-    # )
+
 except FileNotFoundError:
     print(f"Error: OrderTaker.prompty not found at {order_taker_path}")
-    order_taker_func = None
+    order_taker_func = None # Set to None to indicate failure
 except Exception as e:
     print(f"An unexpected error occurred loading OrderTaker prompt: {e}")
-    order_taker_func = None
+    order_taker_func = None # Set to None to indicate failure
 
 # Load the Confirmer function from its prompty file content
 try:
     confirmer_path = os.path.join(prompts_dir, "Confirmer.prompty")
+    # Revert to using from_yaml for Confirmer as well
     with open(confirmer_path, 'r') as f:
         confirmer_yaml = f.read()
-    # Create function from YAML content
     confirmer_func = KernelFunctionFromPrompt.from_yaml(confirmer_yaml)
-    # Optional: Add the function to the kernel's plugins
-    # kernel.plugins.add_functions(
-    #    sk.KernelPlugin(name="ConfirmPlugin", functions=[confirmer_func])
-    # )
+
 except FileNotFoundError:
     print(f"Error: Confirmer.prompty not found at {confirmer_path}")
     confirmer_func = None
@@ -77,8 +97,17 @@ async def get_order_from_text_async(text_input: str) -> dict:
     if not order_taker_func:
          return {"error": "Order Taker function not loaded properly."}
     try:
-        # Run the OrderTaker function
-        result = await kernel.invoke(order_taker_func, KernelArguments(input=text_input))
+        # Format the current menu
+        formatted_menu = format_menu_for_prompt(MENU)
+
+        # Prepare arguments, including the dynamic menu
+        arguments = KernelArguments(input=text_input, menu=formatted_menu)
+
+        # Invoke the function loaded from YAML
+        result = await kernel.invoke(
+             order_taker_func, # Invoke the function object directly
+             arguments=arguments
+        )
 
         # The result from a JSON prompt should ideally be a JSON string.
         result_str = str(result)
@@ -125,6 +154,7 @@ async def get_confirmation_message_async(order_list: list) -> dict:
          return {"error": "Confirmer function not loaded properly."}
     try:
         order_json = json.dumps(order_list)
+        # Invoke the confirmer function loaded from YAML
         result = await kernel.invoke(confirmer_func, KernelArguments(order_json=order_json))
         confirmation_message = str(result).strip()
 

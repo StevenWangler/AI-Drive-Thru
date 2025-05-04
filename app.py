@@ -2,29 +2,21 @@ import streamlit as st
 # We will replace this import later with the kernel service
 from ai_logic import get_order_from_text, get_confirmation_message
 import json # Add json for parsing AI responses
+from data.menu_data import MENU # Import MENU from the new file location
+from streamlit_mic_recorder import mic_recorder # Import the recorder
+import io # For handling audio bytes
+from openai import OpenAI # Import OpenAI
+import os # For environment variables
 
-# --- Menu Data ---
-# Centralized menu definition with icons
-MENU = {
-    "Main Dishes": {
-        "Burger": {"price": 5.00, "item_key": "Burger", "icon": "🍔"},
-        "Cheeseburger": {"price": 5.50, "item_key": "Cheeseburger", "icon": "🧀"}, # Using cheese emoji for variation
-    },
-    "Sides": {
-        "Fries (Regular)": {"price": 2.50, "item_key": "Fries (Regular)", "icon": "🍟"},
-        "Fries (Large)": {"price": 3.50, "item_key": "Fries (Large)", "icon": "🍟"},
-    },
-    "Drinks": {
-        "Coke": {"price": 2.00, "item_key": "Soda", "details": "Coke", "icon": "🥤"},
-        "Sprite": {"price": 2.00, "item_key": "Soda", "details": "Sprite", "icon": "🥤"},
-        "Lemonade": {"price": 2.00, "item_key": "Soda", "details": "Lemonade", "icon": "🍋"}, # Lemon for lemonade
-    },
-    "Desserts": {
-        "Chocolate Milkshake": {"price": 4.00, "item_key": "Milkshake", "details": "Chocolate", "icon": "🧋"},
-        "Vanilla Milkshake": {"price": 4.00, "item_key": "Milkshake", "details": "Vanilla", "icon": "🧋"},
-        "Strawberry Milkshake": {"price": 4.00, "item_key": "Milkshake", "details": "Strawberry", "icon": "🧋"},
-    }
-}
+# --- Initialize OpenAI Client ---
+# Ensure API key is set as an environment variable OPENAI_API_KEY
+try:
+    client = OpenAI()
+    # Test connection (optional, but good practice)
+    client.models.list()
+except Exception as e:
+    st.error(f"Failed to initialize OpenAI client. Ensure OPENAI_API_KEY is set. Error: {e}")
+    client = None # Set client to None to prevent further errors
 
 # --- Helper Function to Add Items ---
 def add_item_to_order(item_key, details=None):
@@ -105,16 +97,62 @@ with col1:
             with st.chat_message(message["role"]):
                 st.markdown(message["content"])
 
-    # Get user input via chat
-    if prompt := st.chat_input("Type your order or ask a question..."):
+    # --- Combine Text and Voice Input Handling ---
+    text_input = st.chat_input("Type your order or ask a question...")
+    voice_input = None # Placeholder for transcribed voice input
+
+    st.write("Or record your order:")
+    # Add the recorder widget
+    # key='recorder' helps manage state. format='webm' is supported by Whisper.
+    audio_info = mic_recorder(
+        start_prompt="🎤 Start Recording",
+        stop_prompt="⏹️ Stop Recording",
+        key='recorder',
+        format='wav',
+        just_once=True # Return audio only once after recording
+    )
+
+    # Check if audio has been recorded
+    if audio_info and client: # Only proceed if recorder returned data AND client is initialized
+        audio_bytes = audio_info['bytes']
+        # Add a check for empty audio data
+        if not audio_bytes:
+            st.warning("Received empty audio recording. Please try again.")
+        else:
+            audio_bio = io.BytesIO(audio_bytes)
+            audio_bio.name = 'audio.wav' # Required for OpenAI API
+
+            # Display audio player for debugging/confirmation (optional)
+            # st.audio(audio_bytes, format='audio/wav') # Update format if uncommenting
+
+            with st.spinner("Transcribing voice..."):
+                try:
+                    transcript = client.audio.transcriptions.create(
+                        model="whisper-1",
+                        file=audio_bio
+                    )
+                    voice_input = transcript.text
+                    st.success(f"Heard: {voice_input}") # Show transcription
+                except Exception as e:
+                    st.error(f"Error transcribing audio: {e}")
+                    voice_input = None # Ensure it's None if transcription failed
+
+
+    # Determine the prompt to process (prioritize voice if available)
+    prompt = voice_input if voice_input else text_input
+
+    # Proceed only if there is a valid prompt (from text or voice)
+    if prompt:
         # Add user message to state and display (inside container)
+        # Use a mic icon if it came from voice
+        user_avatar = "🎤" if voice_input else "👤"
         with chat_container:
-             with st.chat_message("user"):
+             with st.chat_message("user", avatar=user_avatar):
                  st.markdown(prompt)
         st.session_state.messages.append({"role": "user", "content": prompt})
 
         # Process the input with AI using the updated ai_logic
-        with st.spinner("Processing..."):
+        with st.spinner("Processing order..."):
             # Call the refactored function from ai_logic.py
             ai_response = get_order_from_text(prompt) # ai_response is now a dict
 
@@ -201,11 +239,20 @@ with col1:
                              ai_message_content = f"I tried to remove {', '.join(items_not_found_for_removal)}, but I couldn't find those exact items in your order."
                              update_ui = False # No actual change to the order
                         else:
-                             ai_message_content = "I understood the request, but couldn't identify specific actions to perform. Could you please rephrase?"
+                             # If text came from voice, maybe give a slightly different message
+                             if voice_input:
+                                 ai_message_content = "I heard you, but couldn't identify specific items in your request to add or remove from the order."
+                             else:
+                                 ai_message_content = "I understood the request, but couldn't identify specific actions to perform. Could you please rephrase?"
 
                 else:
                     # Status is success, but actions list is empty
-                    ai_message_content = "I understood you, but didn't find specific items in your request to add or remove."
+                    # If text came from voice, maybe give a slightly different message
+                    if voice_input:
+                        ai_message_content = "I heard you, but didn't find specific items in your request to add or remove."
+                    else:
+                        ai_message_content = "I understood you, but didn't find specific items in your request to add or remove."
+
 
             elif status in ["clarification_needed", "item_unavailable", "not_an_order"]:
                 # These statuses should have a 'message' intended for the user
@@ -220,21 +267,37 @@ with col1:
             else: # Handle any other unexpected status values
                 ai_message_content = f"Sorry, I couldn't process that due to an unexpected status: {status}. Please try again."
                 # Optionally log the raw response
-                print(f"Unexpected status '{status}'. Raw response: {ai_response.get('raw_response', ai_response)}")
+                print(f"Unexpected status: {status}. Raw response: {ai_response.get('raw_response', ai_response)}")
 
 
-        # Display AI response message if content exists and wasn't an error shown above
-        # (Errors shown via st.error have show_error_in_chat = True)
-        if ai_message_content and not show_error_in_chat:
-             st.session_state.messages.append({"role": "assistant", "content": ai_message_content})
-             with chat_container:
-                  with st.chat_message("assistant"):
-                      st.markdown(ai_message_content)
+        # Display AI response in chat history (unless it was a technical error shown via st.error)
+        if not show_error_in_chat and ai_message_content:
+            # --- Add Text-to-Speech --- 
+            st.write("Attempting to generate speech...") # Debug message
+            if client: # Check if OpenAI client is available
+                try:
+                    with st.spinner("Generating audio response..."):
+                        response = client.audio.speech.create(
+                            model="tts-1", # Choose a TTS model (tts-1 is standard)
+                            voice="alloy", # Choose a voice (e.g., alloy, echo, fable, onyx, nova, shimmer)
+                            input=ai_message_content,
+                            response_format="mp3" # Choose audio format
+                        )
+                        # Play the audio automatically - TEMPORARILY DISABLED FOR DEBUGGING
+                        st.audio(response.read(), format="audio/mp3") # Removed autoplay=True
+                        st.write("Audio player should be visible above.") # Debug message
+                except Exception as e:
+                    st.error(f"Could not generate audio response: {e}") # Use st.error for visibility
+            # --- End Text-to-Speech ---
+            
+            with chat_container:
+                with st.chat_message("assistant"):
+                    st.markdown(ai_message_content)
+            st.session_state.messages.append({"role": "assistant", "content": ai_message_content})
 
-        # Rerun if the order was updated (update_ui=True)
-        # or if there's a new message/error to display
-        if update_ui or ai_message_content:
-            st.rerun()
+        # If the order was updated OR if voice input was processed, trigger a rerun
+        if update_ui or voice_input:
+             st.rerun()
 
 with col2:
     st.header("Menu")

@@ -3,3 +3,4 @@ openai
 python-dotenv
 semantic-kernel
 pyyaml 
+streamlit-mic-recorder 

@@ -9,12 +9,7 @@ template: |
   Your goal is to accurately interpret the user's request to add or remove items based *only* on the provided menu.
 
   **Menu:**
-  - Burger: $5.00
-  - Cheeseburger: $5.50
-  - Fries (Regular): $2.50
-  - Fries (Large): $3.50
-  - Soda (Coke, Sprite, Lemonade): $2.00
-  - Milkshake (Chocolate, Vanilla, Strawberry): $4.00
+  {{$menu}}
 
   **User Request:**
   {{$input}}
