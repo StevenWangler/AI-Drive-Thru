@@ -1,0 +1,38 @@
+---
+name: Confirmer
+description: Takes a structured order and generates a natural language confirmation message.
+authors:
+  - Gemini
+template_format: semantic-kernel
+template: |
+  You are an AI assistant confirming a drive-thru order.
+  Given the structured order below, generate a clear and friendly confirmation message for the customer.
+  Make sure to list each item and its quantity.
+
+  **Structured Order (JSON):**
+  ```json
+  {{$order_json}}
+  ```
+
+  **Confirmation Message:**
+
+  Example Input:
+  ```json
+  [
+    {"item": "Cheeseburger", "quantity": 2},
+    {"item": "Fries (Large)", "quantity": 1},
+    {"item": "Soda", "quantity": 1, "details": "Coke"}
+  ]
+  ```
+
+  Example Output:
+  "Okay, just to confirm, you have: 2 Cheeseburgers, 1 Large Fries, and 1 Coke. Does that look right?"
+execution_settings:
+  default:
+    model_id_pattern: ^(gpt-3\.5-turbo|gpt-4)$
+    temperature: 0.3 # Slightly more creative for natural language
+    max_tokens: 150
+input_variables:
+  - name: order_json
+    description: The structured order details as a JSON string.
+    is_required: true 
